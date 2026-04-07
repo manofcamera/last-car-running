@@ -2178,7 +2178,13 @@ let mpRemoteState=null;
 function mpInit(mode, joinId){
   mpMode=mode;
   mpPeer=new Peer(mode==='host'?(Math.random().toString(36).slice(2,8).toUpperCase()):undefined,
-    {debug:0});
+    {debug:0,config:{iceServers:[
+      {urls:'stun:stun.l.google.com:19302'},
+      {urls:'stun:openrelay.metered.ca:80'},
+      {urls:'turn:openrelay.metered.ca:80',username:'openrelayproject',credential:'openrelayproject'},
+      {urls:'turn:openrelay.metered.ca:443',username:'openrelayproject',credential:'openrelayproject'},
+      {urls:'turn:openrelay.metered.ca:443?transport=tcp',username:'openrelayproject',credential:'openrelayproject'},
+    ]}});
   mpPeer.on('error',e=>{addKF('NET ERROR: '+e.type);});
 
   if(mode==='host'){
