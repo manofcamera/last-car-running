@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
 <title>LAST CAR RUNNING — Demolition Derby</title>
 <meta name="description" content="8 cars. 1 arena. No mercy. The last car running wins everything.">
+<script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#050508;display:flex;justify-content:center;align-items:center;min-height:100vh;overflow:hidden;font-family:'Courier New',monospace}
@@ -555,6 +556,16 @@ try{const _h=JSON.parse(localStorage.getItem(HS_KEY)||'{}');hiScore={kills:_h.ki
 // input
 const keys={};
 addEventListener('keydown',e=>{
+  if(mpJoinActive&&mpScreen==='lobby'){
+    if(e.key==='Backspace')mpJoinInput=mpJoinInput.slice(0,-1);
+    else if(e.key==='Enter'){
+      if(mpJoinInput.length>=4){
+        mpInit('client',mpJoinInput.toUpperCase());
+        gs='colorpick';mpScreen='';
+      }
+    } else if(e.key.length===1&&mpJoinInput.length<8)mpJoinInput+=e.key.toUpperCase();
+    e.preventDefault();return;
+  }
   if(nameActive&&gs==='colorpick'){
     if(e.key==='Backspace')pName=pName.slice(0,-1);
     else if(e.key==='Enter')nameActive=false;
@@ -1082,14 +1093,19 @@ class Car{
     if(this.mud>0){mspd*=.4;acc*=.4;}
 
     let ti=0,ai=0;
-    if(this.isBot){this.botUpdate(dt,mspd);ti=this.bturn;ai=this.baccel;}
-    else{
+    const isMpClient=mpMode==='client'&&this===playerCar;
+    const isMpRemote=mpMode==='client'&&this!==playerCar;
+    if(this.isBot&&!isMpClient){
+      if(!isMpRemote){this.botUpdate(dt,mspd);}
+      ti=this.bturn;ai=this.baccel;
+    } else if(!isMpRemote){
       if(keys['ArrowLeft']||keys['a']||keys['A'])ti=-1;
       if(keys['ArrowRight']||keys['d']||keys['D'])ti=1;
       if(keys['ArrowUp']||keys['w']||keys['W'])ai=1;
       if(keys['ArrowDown']||keys['s']||keys['S'])ai=-1;
       if(window.mob){ti=window.mob.t;ai=window.mob.a;}
       if((keys[' ']||keys['Space'])&&this.rage>=100&&!this.raging)this.activateRage();
+      if(isMpClient){this.bturn=ti;this.baccel=ai;} // store for sending
     }
     if(this.oil>0)ti=0;
 
@@ -1585,6 +1601,10 @@ function initGame(){
   if(Math.random()<.35){const b=cars.find(c=>c.isBot);if(b){b.hasBounty=true;b.winStreak=3;}}
   crusher.angle=0;camX=0;camY=0;screenShake=0;
   specTarget=null;gs='playing';
+  // MP: assign playerCar based on mpMyIdx
+  if(mpMode==='client'&&mpMyIdx>0&&cars[mpMyIdx]){
+    playerCar=cars[mpMyIdx];playerCar.isBot=false;
+  }
   announce('FIGHT!','#FF3333');
 }
 
@@ -1650,6 +1670,13 @@ function renderMenu(){
 
   const bx=W/2-198,by=H/2+72;
   btn('PLAY',bx,by,396,94,mx>=bx&&mx<=bx+396&&my>=by&&my<=by+94);
+  // multiplayer button
+  const mbx=W/2-198,mby=H/2+180;
+  const mhov=mx>=mbx&&mx<=mbx+396&&my>=mby&&my<=mby+68;
+  cx.fillStyle=mhov?'#003a6e':'#001e3c';cx.fillRect(mbx,mby,396,68);
+  cx.strokeStyle=mhov?'#00AAFF':'#005599';cx.lineWidth=2;cx.strokeRect(mbx,mby,396,68);
+  cx.fillStyle=mhov?'#00CCFF':'#0088CC';cx.font='bold 28px monospace';cx.textAlign='center';
+  cx.fillText('🌐  MULTIPLAYER',W/2,mby+44);
   cx.fillStyle='#444';cx.font='18px monospace';cx.textAlign='center';
   cx.fillText('WASD/ARROWS to drive  •  SPACE to trigger RAGE  •  RAM to deal damage',W/2,H-40);
   cx.fillText('Last car alive wins the prize pool!',W/2,H-14);
@@ -1979,9 +2006,12 @@ function drawHUD(){
 
 // ── CLICK HANDLER ──
 function onClick(x,y){
+  if(mpScreen==='lobby'){mpOnClick(x,y);return;}
   if(gs==='menu'){
+    const mbx=W/2-198,mby=H/2+180;
+    if(x>=mbx&&x<=mbx+396&&y>=mby&&y<=mby+68){mpScreen='lobby';return;}
     const bx=W/2-198,by=H/2+72;
-    if(x>=bx&&x<=bx+396&&y>=by&&y<=by+94)gs='colorpick';
+    if(x>=bx&&x<=bx+396&&y>=by&&y<=by+94){mpMode='solo';gs='colorpick';}
   } else if(gs==='colorpick'){
     const cols=4,cell=144,sx=W/2-(cols*cell)/2,sy=180;
     const nr=Math.ceil(CAR_COLORS.length/cols);
@@ -2131,6 +2161,219 @@ function startGame(){
   document.querySelectorAll('#landing [data-target]').forEach(el=>statIo.observe(el));
 })();
 
+// ══════════════════════════════════════════════
+// ── MULTIPLAYER (PeerJS WebRTC) ──
+// ══════════════════════════════════════════════
+let mpMode='solo'; // 'solo'|'host'|'client'
+let mpPeer=null;   // our PeerJS Peer object
+let mpConns=[];    // host: array of client connections; client: [hostConn]
+let mpMyIdx=0;     // which car index we control
+let mpRoomId='';
+let mpNetT=0;      // send-state timer
+const MP_HZ=20;    // state broadcasts per second
+
+// Client-side: store interpolation target state
+let mpRemoteState=null;
+
+function mpInit(mode, joinId){
+  mpMode=mode;
+  mpPeer=new Peer(mode==='host'?(Math.random().toString(36).slice(2,8).toUpperCase()):undefined,
+    {debug:0});
+  mpPeer.on('error',e=>{addKF('NET ERROR: '+e.type);});
+
+  if(mode==='host'){
+    mpPeer.on('open',id=>{
+      mpRoomId=id;
+      addKF('🌐 Room: '+id+' (share this ID)');
+    });
+    mpPeer.on('connection',conn=>{
+      if(mpConns.length>=7){conn.close();return;}
+      conn.on('open',()=>{
+        const idx=mpConns.length+1; // host is 0
+        mpConns.push({conn,idx,alive:true});
+        conn.send({type:'welcome',idx,
+          name:cars[idx]?cars[idx].name:'Player',
+          col:cars[idx]?cars[idx].colIdx:idx});
+        addKF('🟢 Player '+(idx+1)+' joined');
+        // Make that car human-controlled
+        if(cars[idx]){cars[idx].isBot=false;cars[idx].mpIdx=idx;}
+      });
+      conn.on('data',d=>mpHandleClientMsg(conn,d));
+      conn.on('close',()=>{
+        const ci=mpConns.findIndex(c=>c.conn===conn);
+        if(ci>=0){addKF('🔴 Player '+(ci+2)+' left');mpConns[ci].alive=false;}
+      });
+    });
+  } else {
+    mpPeer.on('open',()=>{
+      const hostConn=mpPeer.connect(joinId,{reliable:false,serialization:'json'});
+      mpConns=[{conn:hostConn,idx:0,alive:true}];
+      hostConn.on('open',()=>addKF('🌐 Connected to host'));
+      hostConn.on('data',d=>mpHandleHostMsg(d));
+      hostConn.on('close',()=>addKF('🔴 Disconnected from host'));
+    });
+  }
+}
+
+function mpHandleClientMsg(conn,d){
+  // Host receives input from client
+  if(d.type==='input'){
+    const entry=mpConns.find(c=>c.conn===conn);
+    if(entry){entry.lastInput=d;}
+  }
+}
+
+function mpHandleHostMsg(d){
+  if(d.type==='welcome'){
+    mpMyIdx=d.idx;
+    addKF('You are Player '+(d.idx+1));
+  } else if(d.type==='state'){
+    mpRemoteState=d;
+  }
+}
+
+function mpApplyClientInputs(){
+  for(const entry of mpConns){
+    if(!entry.alive||!entry.lastInput)continue;
+    const inp=entry.lastInput;
+    const car=cars[entry.idx];
+    if(!car||!car.alive)continue;
+    // Override bot controls with network input
+    car.bturn=inp.t||0;
+    car.baccel=inp.a||0;
+    if(inp.rage&&car.rage>=100&&!car.raging)car.activateRage();
+    entry.lastInput=null;
+  }
+}
+
+function mpBroadcastState(){
+  if(mpConns.length===0)return;
+  const state={
+    type:'state',
+    t:Date.now(),
+    cars:cars.map(c=>({
+      x:Math.round(c.x),y:Math.round(c.y),
+      vx:Math.round(c.vx),vy:Math.round(c.vy),
+      a:+c.a.toFixed(3),
+      hp:Math.round(c.hp),
+      alive:c.alive,
+      raging:c.raging,
+      shieldT:+c.shieldT.toFixed(1),
+      speedT:+c.speedT.toFixed(1),
+    })),
+    pus:powerUps.map(p=>({x:Math.round(p.x),y:Math.round(p.y),ti:PU_TYPES.indexOf(p.t),age:p.age})),
+    arenaR:Math.round(arenaR),
+    crusher:+crusher.angle.toFixed(3),
+    gs,gameTimer:Math.round(gameTimer),
+  };
+  for(const entry of mpConns){
+    if(entry.alive)try{entry.conn.send(state);}catch(e){}
+  }
+}
+
+function mpApplyRemoteState(){
+  if(!mpRemoteState)return;
+  const s=mpRemoteState;
+  // Apply server state to all cars except ours (predict ours locally)
+  for(let i=0;i<s.cars.length&&i<cars.length;i++){
+    if(i===mpMyIdx)continue; // local prediction for our car
+    const sc=s.cars[i],car=cars[i];
+    if(!car)continue;
+    car.x=lerp(car.x,sc.x,0.3);car.y=lerp(car.y,sc.y,0.3);
+    car.vx=sc.vx;car.vy=sc.vy;car.a=sc.a;
+    car.hp=sc.hp;car.alive=sc.alive;
+    car.raging=sc.raging;car.shieldT=sc.shieldT;car.speedT=sc.speedT;
+  }
+  // sync arena state
+  arenaR=s.arenaR;crusher.angle=s.crusher;
+  // sync power-ups
+  powerUps=s.pus.map(p=>({x:p.x,y:p.y,t:PU_TYPES[p.ti]||PU_TYPES[0],age:p.age}));
+  mpRemoteState=null;
+}
+
+function mpSendInput(){
+  if(mpMode!=='client'||!mpConns[0]||!mpConns[0].alive)return;
+  const c=playerCar;if(!c||!c.alive)return;
+  try{mpConns[0].conn.send({
+    type:'input',
+    t:c.bturn!==undefined?c.bturn:0,
+    a:c.baccel!==undefined?c.baccel:0,
+    rage:(keys[' ']||keys['Space'])&&c.rage>=100&&!c.raging
+  });}catch(e){}
+}
+
+// ── MULTIPLAYER UI ──
+let mpScreen=''; // ''|'lobby'
+let mpJoinInput='';
+let mpJoinActive=false;
+
+function renderMPLobby(){
+  cx.fillStyle='#080808';cx.fillRect(0,0,W,H);
+  cx.textAlign='center';
+  cx.fillStyle='#FF3333';cx.font='bold 64px monospace';
+  cx.fillText('MULTIPLAYER',W/2,H/2-280);
+  cx.fillStyle='#555';cx.font='20px monospace';
+  cx.fillText('Play with friends in the same browser or share the Room ID',W/2,H/2-220);
+
+  // HOST button
+  const hbx=W/2-320,hby=H/2-160,hbw=280,hbh=100;
+  const hhov=mx>=hbx&&mx<=hbx+hbw&&my>=hby&&my<=hby+hbh;
+  cx.fillStyle=hhov?'#AA0000':'#660000';cx.fillRect(hbx,hby,hbw,hbh);
+  cx.strokeStyle='#FF3333';cx.lineWidth=2;cx.strokeRect(hbx,hby,hbw,hbh);
+  cx.fillStyle='#FFF';cx.font='bold 28px monospace';cx.fillText('HOST GAME',hbx+hbw/2,hby+hbh/2+10);
+  cx.fillStyle='#888';cx.font='16px monospace';cx.fillText('You create the room',hbx+hbw/2,hby+hbh/2+34);
+
+  // JOIN section
+  const jbx=W/2+40,jby=H/2-160,jbw=280,jbh=100;
+  cx.fillStyle='#003366';cx.fillRect(jbx,jby,jbw,jbh);
+  cx.strokeStyle='#0088FF';cx.lineWidth=2;cx.strokeRect(jbx,jby,jbw,jbh);
+  cx.fillStyle='#FFF';cx.font='bold 28px monospace';cx.fillText('JOIN GAME',jbx+jbw/2,jby+jbh/2+10);
+  cx.fillStyle='#888';cx.font='16px monospace';cx.fillText('Enter Room ID',jbx+jbw/2,jby+jbh/2+34);
+
+  // Room ID input
+  cx.fillStyle='rgba(0,0,0,.7)';cx.fillRect(W/2-240,H/2+10,480,60);
+  cx.strokeStyle=mpJoinActive?'#0088FF':'#444';cx.lineWidth=2;cx.strokeRect(W/2-240,H/2+10,480,60);
+  cx.fillStyle=mpJoinInput?'#FFF':'#555';cx.font='bold 32px monospace';
+  cx.fillText(mpJoinInput||(mpJoinActive?'':'ROOM ID...'),W/2,H/2+53)
+  ;
+
+  // Room display if host
+  if(mpMode==='host'&&mpRoomId){
+    cx.fillStyle='rgba(0,80,0,.4)';cx.fillRect(W/2-300,H/2+90,600,70);
+    cx.strokeStyle='#00FF44';cx.lineWidth=2;cx.strokeRect(W/2-300,H/2+90,600,70);
+    cx.fillStyle='#888';cx.font='18px monospace';cx.fillText('YOUR ROOM ID (share with friends):',W/2,H/2+114);
+    cx.fillStyle='#00FF44';cx.font='bold 40px monospace';cx.shadowColor='#00FF44';cx.shadowBlur=10;
+    cx.fillText(mpRoomId,W/2,H/2+148);cx.shadowBlur=0;
+  }
+
+  // back button
+  const bbx=W/2-100,bby=H/2+185;
+  const bhov=mx>=bbx&&mx<=bbx+200&&my>=bby&&my<=bby+50;
+  cx.fillStyle=bhov?'#333':'#1a1a1a';cx.fillRect(bbx,bby,200,50);
+  cx.strokeStyle='#555';cx.lineWidth=1;cx.strokeRect(bbx,bby,200,50);
+  cx.fillStyle='#888';cx.font='bold 22px monospace';cx.fillText('← BACK',W/2,bby+34);
+}
+
+function mpOnClick(x,y){
+  if(mpScreen!=='lobby')return false;
+  // HOST
+  const hbx=W/2-320,hby=H/2-160,hbw=280,hbh=100;
+  if(x>=hbx&&x<=hbx+hbw&&y>=hby&&y<=hby+hbh){
+    if(mpMode!=='host'){mpInit('host','');}
+    gs='colorpick';mpScreen='';return true;
+  }
+  // JOIN box = activate input
+  const jbx=W/2+40,jby=H/2-160,jbw=280,jbh=100;
+  if(x>=jbx&&x<=jbx+jbw&&y>=jby&&y<=jby+jbh){mpJoinActive=true;return true;}
+  // input area
+  if(x>=W/2-240&&x<=W/2+240&&y>=H/2+10&&y<=H/2+70){mpJoinActive=true;return true;}
+  // BACK
+  if(x>=W/2-100&&x<=W/2+100&&y>=H/2+185&&y<=H/2+235){
+    mpScreen='';mpMode='solo';if(mpPeer){mpPeer.destroy();mpPeer=null;}mpConns=[];return true;
+  }
+  return false;
+}
+
 // ── MAIN LOOP ──
 let lt=0;
 function loop(ts){
@@ -2150,8 +2393,15 @@ function loop(ts){
     if(gameTimer>180&&!suddenDeath){suddenDeath=true;announce('☠ SUDDEN DEATH ☠','#FF0000');}
     prizeTarget+=dt*2.5;
     crusher.angle+=1.2*dt;
+    // multiplayer: apply client inputs on host, apply remote state on client
+    if(mpMode==='host')mpApplyClientInputs();
+    if(mpMode==='client'){mpApplyRemoteState();mpSendInput();}
     for(const c2 of cars)c2.update(dt);
-    carCollide();hazardCheck(dt);updatePowerUps(dt);updatePart(dt);updateAnn(dt);
+    // host-only: run authoritative simulation
+    if(mpMode!=='client'){carCollide();hazardCheck(dt);updatePowerUps(dt);}
+    updatePart(dt);updateAnn(dt);
+    // host broadcasts state
+    if(mpMode==='host'){mpNetT+=dt;if(mpNetT>=1/MP_HZ){mpNetT=0;mpBroadcastState();}}
     // spectator camera follow
     if(gs==='spectating'){
       const a2=cars.filter(c2=>c2.alive);
@@ -2172,6 +2422,7 @@ function loop(ts){
   }
   // render
   cx.clearRect(0,0,W,H);
+  if(mpScreen==='lobby'){renderMPLobby();requestAnimationFrame(loop);return;}
   if(gs==='menu')renderMenu();
   else if(gs==='colorpick')renderColorPick();
   else if(gs==='matchmaking')renderMM();
